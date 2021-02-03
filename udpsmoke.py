@@ -170,10 +170,13 @@ async def open_datagram_endpoint(host, port, *, endpoint_factory=Endpoint, **kwa
   return endpoint
 
 
+# Actual UDPsmoke implementation
+
 header = struct.Struct('!cQdI')
 payload = ('*'*PAYLOAD_LEN).encode('ascii')
 def genping(pid):
   return header.pack(b'p', pid, time.perf_counter(), len(payload)) + payload
+
 
 def readpacket(data):
   op, pid, t, plen = header.unpack_from(data)
@@ -182,15 +185,13 @@ def readpacket(data):
     raise ValueError(f"Payload length {plen} differs from payload {len(pl)}.")
   return op, pid, t, pl
 
+
 def genpong(pid, t, pl):
   return header.pack(b'r', pid, t, len(payload)) + payload
 
 
-# Actual UDPsmoke implementation
-
 class PeerStatus:
   __slots__ = ['lastpid', 'pending', 'sent', 'received', 'outoforder', 'prev_sent', 'prev_received', 'prev_outoforder', 'rtt_avg', 'rtt_var', 'win', 'interval', 'rtt_data']
-
 
   def __init__(self, interval):
     self.interval = interval
