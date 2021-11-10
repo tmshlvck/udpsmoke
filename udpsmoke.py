@@ -123,9 +123,10 @@ class SmokeProtocol:
     return cls.HEADER.pack(cls.PKT_TYPE_PONG, pid, len(pl)) + pl
 
 
-  __slots__ = ['lock', 'ip', 'name', 'lastsentpid', 'lastrcvdpid', 'pending', 'sent', 'received', 'lost', 'outoforder', 'rtt_sum', 'rtt_avg', 'rtt_var', 'win', 'interval', 'rtt_data']
+  __slots__ = ['lock', 'ip', 'proto', 'name', 'lastsentpid', 'lastrcvdpid', 'pending', 'sent', 'received', 'lost', 'outoforder', 'rtt_sum', 'rtt_avg', 'rtt_var', 'win', 'interval', 'rtt_data']
   def __init__(self, ip, interval, name=None, timeout=TIMEOUT):
     self.ip = ip
+    self.proto = 4 if ipaddress.ip_address(ip).ipv4_mapped != None else 6
     self.name = name
 
     self.lock = threading.Lock()
@@ -218,9 +219,11 @@ class SmokeProtocol:
   def get_prometheus_metrics(self):
     self.lock.acquire()
     self._update_lost_unsafe()
-    ret = [Counter('sent', self.sent, {'peerip': self.ip, 'peer': self.name}),
-           Counter('received', self.received, {'peerip': self.ip, 'peer': self.name}), Counter('lost', self.lost, {'peerip': self.ip, 'peer': self.name}),
-           Counter('outoforder', self.outoforder, {'peerip': self.ip, 'peer': self.name}), Summary('rtt', self.rtt_sum, self.received, {'peerip': self.ip, 'peer': self.name})]
+    ret = [Counter('sent', self.sent, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Counter('received', self.received, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Counter('lost', self.lost, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Counter('outoforder', self.outoforder, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Summary('rtt', self.rtt_sum, self.received, {'peerip':self.ip,'peer':self.name,'proto':self.proto})]
     self.lock.release()
     return ret
 
