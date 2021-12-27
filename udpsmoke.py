@@ -353,11 +353,27 @@ def main():
   if args.verb:
     logging.basicConfig(level=logging.DEBUG)
 
-  def normalize_ip(ip):
-    if ipaddress.ip_address(ip).version == 4:
-      return f'::ffff:{ip}'
-    else:
-      return ip
+  def normalize_ip(hostname):
+    try:
+      if ipaddress.ip_address(hostname).version == 4:
+        return f'::ffff:{hostname}'
+      else:
+        return hostname
+    except ValueError:
+      pass
+
+    try:
+      return socket.getaddrinfo(hostname, None, socket.AF_INET6, socket.SOCK_DGRAM)[0][4][0]
+    except socket.gaierror:
+      pass
+
+    try:
+      return socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_DGRAM)[0][4][0]
+    except socket.gaierror:
+      pass
+
+    raise ValueError(f"Hostname {hostname} it not an IP address nor can it be resolved to IP address.")
+
 
   def get_tgt(l):
     spl = l.strip().split(' ')
