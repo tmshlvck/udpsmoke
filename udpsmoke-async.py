@@ -17,8 +17,9 @@ You should have received a copy of the GNU General Public License along with
 this program. If not, see <http://www.gnu.org/licenses/>.
 """
 
-PAYLOAD_LEN=100
-TIMEOUT = 2 # sec
+PAYLOAD_LEN = 100
+TIMEOUT = 10 # sec
+SCRAPE_INTERVAL = 15 # sec - this is the expected Prometheus scrape interval, but the RTT sliding window average uses it as well
 
 
 import click
@@ -27,12 +28,14 @@ import asyncio
 import time
 import csv
 import struct
-from dataclasses import dataclass
 import warnings
 import ipaddress
+import socket
 import curses
 import math
+import sys
 
+# UDP Async Server Boilerplate
 
 class DatagramEndpointProtocol(asyncio.DatagramProtocol):
   """Datagram protocol for the endpoint high-level interface."""
@@ -111,13 +114,13 @@ class Endpoint:
 
   # User methods
 
-  def send(self, data, addr):
+  def sendto(self, data, addr):
     """Send a datagram to the given address."""
     if self._closed:
       raise IOError("Enpoint is closed")
     self._transport.sendto(data, addr)
 
-  async def receive(self):
+  async def recvfrom(self):
     """Wait for an incoming datagram and return it with
     the corresponding address.
     This method is a coroutine.
@@ -171,55 +174,71 @@ async def open_datagram_endpoint(host, port, *, endpoint_factory=Endpoint, **kwa
 
 
 # Actual UDPsmoke implementation
+class SmokeProtocol:
+  HEADER = struct.Struct('!cQI')
+  PAYLOAD = ('*'*PAYLOAD_LEN).encode('ascii')
 
-header = struct.Struct('!cQdI')
-payload = ('*'*PAYLOAD_LEN).encode('ascii')
-def genping(pid):
-  return header.pack(b'p', pid, time.perf_counter(), len(payload)) + payload
+  PKT_TYPE_PING = b'p'
+  PKT_TYPE_PONG = b'r'
 
-
-def readpacket(data):
-  op, pid, t, plen = header.unpack_from(data)
-  pl = data[header.size:].decode('ascii')
-  if len(pl) != plen:
-    raise ValueError(f"Payload length {plen} differs from payload {len(pl)}.")
-  return op, pid, t, pl
+  @classmethod
+  def gen_ping(cls, pid):
+    return cls.HEADER.pack(cls.PKT_TYPE_PING, pid, len(cls.PAYLOAD)) + cls.PAYLOAD
 
 
-def genpong(pid, t, pl):
-  return header.pack(b'r', pid, t, len(payload)) + payload
+  @classmethod
+  def decode_packet(cls, data):
+    op, pid, plen = cls.HEADER.unpack_from(data)
+    pl = data[cls.HEADER.size:]
+    if len(pl) != plen:
+      raise ValueError(f"Payload length {plen} differs from payload {len(pl)}.")
+    return op, pid, pl
 
 
-class PeerStatus:
-  __slots__ = ['lastpid', 'pending', 'sent', 'received', 'outoforder', 'prev_sent', 'prev_received', 'prev_outoforder', 'rtt_avg', 'rtt_var', 'win', 'interval', 'rtt_data']
+  @classmethod
+  def gen_pong(cls, pid, pl):
+    return cls.HEADER.pack(cls.PKT_TYPE_PONG, pid, len(pl)) + pl
 
-  def __init__(self, interval):
-    self.interval = interval
-    self.win = int(10/self.interval)
-    if self.win > 500:
-      self.win = 500
-    if self.win < 10:
-      self.win = 10
 
-    self.lastpid = 0
-    self.pending = set()
+  __slots__ = ['lock', 'ip', 'proto', 'name', 'lastsentpid', 'lastrcvdpid', 'pending', 'sent', 'received', 'lost', 'outoforder', 'rtt_sum', 'rtt_avg', 'rtt_var', 'win', 'interval', 'rtt_data']
+  def __init__(self, lock, ip, interval, name=None, timeout=TIMEOUT):
+    self.ip = ip
+    self.proto = 4 if ipaddress.ip_address(ip).ipv4_mapped != None else 6
+    self.name = name
+
+    self.lock = lock
+    self.lastsentpid = 0
+    self.lastrcvdpid = 0
+    self.pending = {}
+
     self.sent = 0
     self.received = 0
+    self.lost = 0
     self.outoforder = 0
-    self.prev_sent = 0
-    self.prev_received = 0
-    self.prev_outoforder = 0
+    self.rtt_sum = 0.0
     self.rtt_avg = 0.0
     self.rtt_var = 0.0
+
+    self.win = int(SCRAPE_INTERVAL/interval)
     self.rtt_data = [None]*self.win
 
-  def incSent(self, pid=None):
+
+  def emit_ping(self):
+    self.lock.acquire()
+    
+    self.lastsentpid+=1
+    if self.lastsentpid > 2**63:
+      self.lastsentpid = 1
+    self.pending[self.lastsentpid] = time.perf_counter()
     self.sent += 1
-    if pid:
-      self.lastpid = pid
-      self.pending.add(pid)
+
+    self.lock.release()
+
+    return self.gen_ping(self.lastsentpid)
+
 
   def _updateRtt(self, rtt):
+    self.rtt_sum += rtt
     self.rtt_data.append(rtt)
     oldestpoint = self.rtt_data.pop(0)
 
@@ -236,94 +255,135 @@ class PeerStatus:
       if self.rtt_var < 0: # this can happen due to rounding errors
         self.rtt_var == 0.0
 
-  def incReceived(self, pid, rtt=None):
-    if self.pending and pid == min(self.pending):
-      self.received += 1
-    else:
-      self.outoforder += 1
+
+  def process_pong(self, pid):
+    recv_t = time.perf_counter()
+
+    self.lock.acquire()
 
     if pid in self.pending:
-      self.pending.remove(pid)
-
-    if rtt:
+      self.received += 1
+      rtt = 1000*(recv_t - self.pending[pid])
+      self.pending.pop(pid)
       self._updateRtt(rtt)
+      if self.lastrcvdpid < pid or pid == 1:
+        pass
+      else:
+        self.outoforder += 1
+      self.lastrcvdpid = pid
+    else:
+      pass # received packet that is not expected -> ignore
 
-  def csvRow(self, ip):
-    lost = set()
-    for p in self.pending:
-      if (self.lastpid - p)*self.interval > TIMEOUT:
-        lost.add(p)
-    self.pending.difference_update(lost)
-
-    res = (ip, int(time.time()), self.sent-self.prev_sent, self.received-self.prev_received, self.outoforder-self.prev_outoforder, len(lost), self.rtt_avg, math.sqrt(self.rtt_var))
-    #res = (ip, int(time.time()), self.sent-self.prev_sent, self.received-self.prev_received, self.outoforder-self.prev_outoforder, len(lost)+len(self.pending), self.rtt_avg, math.sqrt(self.rtt_var))
-    self.prev_sent = self.sent
-    self.prev_received = self.received
-    self.prev_outoforder = self.outoforder
-    return res
+    self.lock.release()
 
 
-async def run_server(ep, status):
+  def _update_lost_unsafe(self):
+    t = time.perf_counter()
+    timedout = [pid for pid in self.pending if t > self.pending[pid]+TIMEOUT]
+    for pid in timedout:
+      self.lost += 1
+      self.pending.pop(pid)
+
+
+  def get_human_metrics(self):
+    self.lock.acquire()
+    self._update_lost_unsafe()
+    ret = (self.sent, self.received, self.lost, self.outoforder, self.rtt_avg, self.rtt_var)
+    self.lock.release()
+    return ret
+
+
+  def get_prometheus_metrics(self):
+    self.lock.acquire()
+    self._update_lost_unsafe()
+    ret = [Counter('sent', self.sent, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Counter('received', self.received, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Counter('lost', self.lost, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Counter('outoforder', self.outoforder, {'peerip':self.ip,'peer':self.name,'proto':self.proto}),
+           Summary('rtt', self.rtt_sum, self.received, {'peerip':self.ip,'peer':self.name,'proto':self.proto})]
+    self.lock.release()
+    return ret
+
+
+class AsyncSmokeProtocol(SmokeProtocol):
+  class NoLock:
+    def acquire(self):
+      pass
+    def release(self):
+      pass
+
+  def __init__(self, ip, interval, name=None, timeout=TIMEOUT):
+    lock = self.NoLock()
+    super().__init__(lock, ip, interval, name, timeout)
+
+
+async def receiver_task(ep, status):
   while True:
-    data, addr = await ep.receive()
-    ip, port, _, _ = addr
-    op, pid, t, payload = readpacket(data)
+    data, addr = await ep.recvfrom()
 
-    if op == b'p':
-      ep.send(genpong(pid, t, payload), (ip, port))
-    elif op == b'r':
+    ip, port, _, _ = addr
+    try:
+      op, pid, payload = AsyncSmokeProtocol.decode_packet(data)
+    except Exception as e:
+      warnings.warn(f"Decoding exception: {e}")
+      continue
+
+    if op == SmokeProtocol.PKT_TYPE_PING:
+      ep.sendto(SmokeProtocol.gen_pong(pid, payload), (ip, port))
+    elif op == SmokeProtocol.PKT_TYPE_PONG:
       if ip in status:
-        s = status[ip]
-        rtt = time.perf_counter() - t 
-        s.incReceived(pid, rtt*1000) # normalize to ms
+        status[ip].process_pong(pid)
       else:
         warnings.warn(f"Packet from unknown IP {ip}")
     else:
       warnings.warn(f"Malformed packet from IP {ip}")
-    
 
-async def send_pings(ip, port, ep, status, interval):
-  pid = 1
+
+async def initiator_task(ep, status, port, interval):
   while True:
-    ep.send(genping(pid),(ip, port))
-    s = status[ip]
-    s.incSent(pid)
-    pid += 1
+    for ip in status:
+      ep.sendto(status[ip].emit_ping(),(ip, port))
     await asyncio.sleep(interval)
 
-def dump_status(status, stdscr):
-  for ln, ip in enumerate(sorted(status.keys(), reverse=True)):
-    s = status[ip]
-    loss = (s.sent-s.received-s.outoforder)
-    lossp = (100*loss/s.sent) if s.sent > 0 else 0
-    args = []
-    if lossp > 10:
-      args.append(curses.A_STANDOUT)
 
-    l = f'{ip} sent:{s.sent} recv:{s.received} outordr:{s.outoforder} loss:{loss} rtt_avg:{round(s.rtt_avg, 3)} ms rtt_sd:{round(math.sqrt(s.rtt_var),3)}'
-    stdscr.addstr(ln, 0, l, *args)
-    stdscr.clrtoeol()
-  stdscr.refresh()
-
-async def dump_status_task(status, interval):
-  screen_refresh = interval*25
-  if screen_refresh < 1:
-    screen_refresh = 1
-  if screen_refresh > 30:
-    screen_refresh = interval
-
+async def ui_task(status, screen_refresh):
   try:
     stdscr = curses.initscr()
+    stdscr.nodelay(True)
 
+    last = {}
     while True:
-      dump_status(status, stdscr)
+      k = stdscr.getch()
+      if k > 0 and chr(k) == 'q':
+        sys.exit()
+
+      for ln, ip in enumerate(sorted(status.keys(), reverse=True)):
+        sent, received, lost, outoforder, rtt_avg, rtt_var = status[ip].get_human_metrics()
+
+        last_sent, last_received, last_lost, last_outoforder = last.get(ip, (0,0,0,0))
+        oorate, lostrate = ((outoforder-last_outoforder)/screen_refresh, (lost-last_lost)/screen_refresh, )  
+        last[ip] = (sent, received, lost, outoforder)
+
+        if status[ip].name:
+          l = f'{status[ip].name} tx:{sent} rx:{received} outordr:{outoforder} ({oorate}/s) lost:{lost} ({lostrate}/s) rtt_avg:{round(rtt_avg, 3)} ms rtt_sd:{round(math.sqrt(rtt_var),3)}'
+        else:
+          l = f'{ip} tx:{sent} rx:{received} outordr:{outoforder} ({oorate}/s) lost:{lost} ({lostrate}/s) rtt_avg:{round(rtt_avg, 3)} ms rtt_sd:{round(math.sqrt(rtt_var),3)}'
+
+        args = []
+        if oorate > 0 or lostrate >0:
+          args.append(curses.A_STANDOUT)
+
+        stdscr.addstr(ln, 0, l, *args)
+        stdscr.clrtoeol()
+
+      stdscr.refresh()
       await asyncio.sleep(screen_refresh)
 
   finally:
     curses.endwin()
 
 
-async def dump_csv_task(status, filename, interval):
+async def csv_task(status, filename, interval):
   csv_refresh = interval*25
   if csv_refresh < 1:
     csv_refresh = 1
@@ -339,44 +399,75 @@ async def dump_csv_task(status, filename, interval):
     await asyncio.sleep(csv_refresh)
 
 
+async def prometheus_task(status):
+  pass
 
-async def start_all(tgtips, port, interval, csvfile):
-  ep = await open_datagram_endpoint('::', port)
+
+async def start_all(tgtips, port, interval, refresh, csvfile, bind):
+  ep = await open_datagram_endpoint(bind, port)
 
   tsk = []
-  status = {ip:PeerStatus(interval) for ip in tgtips}
-  tsk.append(asyncio.create_task(run_server(ep, status)))
+  status = {ip:AsyncSmokeProtocol(ip, interval, name) for ip, name in tgtips}
+  tsk.append(asyncio.create_task(receiver_task(ep, status)))
 
-  for ip in tgtips:
-    tsk.append(asyncio.create_task(send_pings(ip, port, ep, status, interval)))
+  tsk.append(asyncio.create_task(initiator_task(ep, status, port, interval)))
 
-  tsk.append(asyncio.create_task(dump_status_task(status, interval)))
+  tsk.append(asyncio.create_task(ui_task(status, refresh)))
+
+  #tsk.append(asyncio.create_task(prometheus_task(status)))
+
   if csvfile:
-    tsk.append(asyncio.create_task(dump_csv_task(status, csvfile, interval)))
+    tsk.append(asyncio.create_task(csv_task(status, csvfile, interval)))
 
   await asyncio.gather(*tsk)
 
-
-def normalize_ip(ip):
-  if ipaddress.ip_address(ip).version == 4:
-    return f'::ffff:{ip}'
-  else:
-    return ip
 
 @click.command(help="run UDP ping with a list of remote servers and run UDP echo server")
 @click.option('-v', '--verbose', 'verb', help="verbose output", is_flag=True)
 @click.option('-t', '--targets', 'tgts', help="list of targets", type=click.File('r'), required=True)
 @click.option('-p', '--port', 'port', help="port to use", default=54321)
 @click.option('-i', '--interval', 'interval', help="time interval between pings", default=0.2)
+@click.option('-r', '--refresh', 'refresh', help="curses UI refresh interval (s)", default=1)
 @click.option('-c', '--csv', 'csvfile', help="CSV output", type=click.Path())
-def main(verb, tgts, port, interval, csvfile):
+@click.option('-b', '--bind', 'bind', help="bind IPv6-formatted (IPv6 or ::ffff:<IPv4>) address", default='::')
+def main(verb, tgts, port, interval, refresh, csvfile, bind):
   if verb:
     logging.basicConfig(level=logging.DEBUG)
 
-  tgtips = [normalize_ip(l.strip()) for l in tgts.readlines()]
+  def normalize_ip(hostname):
+    try:
+      if ipaddress.ip_address(hostname).version == 4:
+        return f'::ffff:{hostname}'
+      else:
+        return hostname
+    except ValueError:
+      pass
+
+    try:
+      return socket.getaddrinfo(hostname, None, socket.AF_INET6, socket.SOCK_DGRAM)[0][4][0]
+    except socket.gaierror:
+      pass
+
+    try:
+      return socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_DGRAM)[0][4][0]
+    except socket.gaierror:
+      pass
+
+    raise ValueError(f"Hostname {hostname} it not an IP address nor can it be resolved to IP address.")
+
+
+  def get_tgt(l):
+    spl = l.strip().split(' ')
+    if len(spl) == 1:
+      return (normalize_ip(spl[0].strip()), None)
+    else:
+      return (normalize_ip(spl[0].strip()), spl[1].strip())
+
+
+  tgtips = [get_tgt(l) for l in tgts.readlines() if l.strip()]
   port = int(port)
 
-  asyncio.run(start_all(tgtips, port, interval, csvfile))
+  asyncio.run(start_all(tgtips, port, interval, refresh, csvfile, bind))
 
 
 if __name__ == '__main__':
