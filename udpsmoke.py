@@ -22,7 +22,6 @@ TIMEOUT = 10 # sec
 SCRAPE_INTERVAL = 15 # sec - this is the expected Prometheus scrape interval, but the RTT sliding window average uses it as well
 
 
-#import click
 import argparse
 import logging
 import time
@@ -124,12 +123,12 @@ class SmokeProtocol:
 
 
   __slots__ = ['lock', 'ip', 'proto', 'name', 'lastsentpid', 'lastrcvdpid', 'pending', 'sent', 'received', 'lost', 'outoforder', 'rtt_sum', 'rtt_avg', 'rtt_var', 'win', 'interval', 'rtt_data']
-  def __init__(self, ip, interval, name=None, timeout=TIMEOUT):
+  def __init__(self, lock, ip, interval, name=None, timeout=TIMEOUT):
     self.ip = ip
     self.proto = 4 if ipaddress.ip_address(ip).ipv4_mapped != None else 6
     self.name = name
 
-    self.lock = threading.Lock()
+    self.lock = lock
     self.lastsentpid = 0
     self.lastrcvdpid = 0
     self.pending = {}
@@ -228,13 +227,19 @@ class SmokeProtocol:
     return ret
 
 
+class ThreadingSmokeProtocol(SmokeProtocol):
+  def __init__(self, ip, interval, name=None, timeout=TIMEOUT):
+    lock = threading.Lock()
+    super().__init__(lock, ip, interval, name, timeout)
+
+
 def receiver_loop(sock, status):
   while True:
     data, addr = sock.recvfrom(65535)
 
     ip, port, _, _ = addr
     try:
-      op, pid, payload = SmokeProtocol.decode_packet(data)
+      op, pid, payload = ThreadingSmokeProtocol.decode_packet(data)
     except Exception as e:
       warnings.warn(f"Decoding exception: {e}")
       continue
@@ -330,15 +335,6 @@ def prometheus_server_loop(status, listen="::", port=8888):
   httpd.serve_forever()
   
 
-
-#@click.command(help="run UDP ping with a list of remote servers and run UDP echo server")
-#@click.option('-v', '--verbose', 'verb', help="verbose output", is_flag=True)
-#@click.option('-t', '--targets', 'tgts', help="list of targets", type=click.File('r'))
-#@click.option('-p', '--port', 'port', help="port to use", default=54321)
-#@click.option('-i', '--interval', 'interval', help="time interval between pings (s)", default=0.2)
-#@click.option('-r', '--refresh', 'refresh', help="curses UI refresh interval (s)", default=1)
-#def main(verb, tgts, port, interval, refresh):
-
 def main():
   parser = argparse.ArgumentParser(description='run UDP ping with a list of remote servers and run UDP echo server')
   parser.add_argument('-v', '--verbose', dest='verb', action='store_const', const=True, default=False, help='verbose output')
@@ -392,7 +388,7 @@ def main():
   interval = float(args.interval)
   refresh = int(args.refresh)
 
-  status = {ip:SmokeProtocol(ip, interval, name) for ip, name in tgtips}
+  status = {ip:ThreadingSmokeProtocol(ip, interval, name) for ip, name in tgtips}
 
   sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
   sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
