@@ -20,6 +20,8 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 PAYLOAD_LEN = 100
 TIMEOUT = 10 # sec
 SCRAPE_INTERVAL = 15 # sec - this is the expected Prometheus scrape interval, but the RTT sliding window average uses it as well
+PROMETHEUS_SERVER_LISTEN="::"
+PROMETHEUS_SERVER_PORT=8888
 
 
 import argparse
@@ -299,8 +301,7 @@ def ui_loop(status, screen_refresh):
   finally:
     curses.endwin()
 
-
-def prometheus_server_loop(status, listen="::", port=8888):
+def prometheus_server_loop(status, listen=PROMETHEUS_SERVER_LISTEN, port=PROMETHEUS_SERVER_PORT):
   namespace = "udpsmoke"
 
   class PrometheusHandler(http.server.SimpleHTTPRequestHandler):
@@ -348,6 +349,8 @@ def main():
 
   if args.verb:
     logging.basicConfig(level=logging.DEBUG)
+  else:
+    logging.basicConfig(level=logging.INFO)
 
   def normalize_ip(hostname):
     try:
