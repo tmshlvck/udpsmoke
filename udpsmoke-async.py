@@ -20,6 +20,8 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 PAYLOAD_LEN = 100
 TIMEOUT = 10 # sec
 SCRAPE_INTERVAL = 15 # sec - this is the expected Prometheus scrape interval, but the RTT sliding window average uses it as well
+PROMETHEUS_SERVER_LISTEN=None
+PROMETHEUS_SERVER_PORT=8888
 
 
 import click
@@ -34,6 +36,7 @@ import socket
 import curses
 import math
 import sys
+import aiohttp
 
 # UDP Async Server Boilerplate
 
@@ -173,7 +176,64 @@ async def open_datagram_endpoint(host, port, *, endpoint_factory=Endpoint, **kwa
   return endpoint
 
 
+# Prometheus minimalistic server
+
+class Counter:
+  def __init__(self, name, value, labels):
+    self.name = name
+    self.value = value
+    self.labels = labels
+
+  def render(self, namespace):
+    mn = f"{namespace}_{self.name}"
+    ret = ''
+    # help
+    ret += f"# HELP {mn} metric {self.name}\n"
+    ret += f"# TYPE {mn} counter\n"
+
+    rlabels = ''
+    for l in self.labels:
+      if rlabels:
+        rlabels+=','
+      rlabels += f'{l}="{self.labels[l]}"'
+    ret += f'{mn}{{{rlabels}}} {self.value}\n'
+
+    return ret.encode()
+
+
+class Summary:
+  def __init__(self, name, summ, count, labels, quantiles=None):
+    self.name = name
+    self.summ = summ
+    self.count = count
+    self.labels = labels
+    self.quantiles = quantiles
+
+  def render(self, namespace):
+    mn = f"{namespace}_{self.name}"
+    ret = ''
+    # help
+    ret += f"# HELP {mn} metric {self.name}\n"
+    ret += f"# TYPE {mn} summary\n"
+
+    rlabels = ''
+    for l in self.labels:
+      if rlabels:
+        rlabels+=','
+      rlabels += f'{l}="{self.labels[l]}"'
+
+    if self.quantiles:
+      for q,v in self.quantiles:
+        ret += f'{mn}{{quantile="{q}",{rlabels}}} {v}\n'
+
+    ret += f'{mn}_sum{{{rlabels}}} {self.summ}\n'
+    ret += f'{mn}_count{{{rlabels}}} {self.count}\n'
+
+    return ret.encode()
+
+
 # Actual UDPsmoke implementation
+
 class SmokeProtocol:
   HEADER = struct.Struct('!cQI')
   PAYLOAD = ('*'*PAYLOAD_LEN).encode('ascii')
@@ -399,8 +459,26 @@ async def csv_task(status, filename, interval):
     await asyncio.sleep(csv_refresh)
 
 
-async def prometheus_task(status):
-  pass
+import aiohttp.web
+async def prometheus_task(status, listen=PROMETHEUS_SERVER_LISTEN, port=PROMETHEUS_SERVER_PORT):
+  namespace = "udpsmoke"
+  async def handler(request):
+    b = b''
+    for ip in status:
+      for m in status[ip].get_prometheus_metrics():
+        b += m.render(namespace)
+    return aiohttp.web.Response(body=b)
+
+  app = aiohttp.web.Application()
+  app.add_routes([aiohttp.web.get('/', handler)])
+
+  logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
+  logging.getLogger('aiohttp.client').setLevel(logging.WARNING)
+  logging.getLogger('aiohttp.internal').setLevel(logging.WARNING)
+  logging.getLogger('aiohttp.server').setLevel(logging.WARNING)
+  logging.getLogger('aiohttp.web').setLevel(logging.WARNING)
+  logging.getLogger('aiohttp.websocket').setLevel(logging.WARNING)
+  await aiohttp.web._run_app(app, host=listen, port=port, print=None)
 
 
 async def start_all(tgtips, port, interval, refresh, csvfile, bind):
@@ -414,7 +492,7 @@ async def start_all(tgtips, port, interval, refresh, csvfile, bind):
 
   tsk.append(asyncio.create_task(ui_task(status, refresh)))
 
-  #tsk.append(asyncio.create_task(prometheus_task(status)))
+  tsk.append(asyncio.create_task(prometheus_task(status)))
 
   if csvfile:
     tsk.append(asyncio.create_task(csv_task(status, csvfile, interval)))
@@ -433,6 +511,8 @@ async def start_all(tgtips, port, interval, refresh, csvfile, bind):
 def main(verb, tgts, port, interval, refresh, csvfile, bind):
   if verb:
     logging.basicConfig(level=logging.DEBUG)
+  else:
+    logging.basicConfig(level=logging.INFO)
 
   def normalize_ip(hostname):
     try:
