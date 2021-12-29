@@ -421,7 +421,7 @@ async def ui_task(status, screen_refresh):
         sent, received, lost, outoforder, rtt_avg, rtt_var = status[ip].get_human_metrics()
 
         last_sent, last_received, last_lost, last_outoforder = last.get(ip, (0,0,0,0))
-        oorate, lostrate = ((outoforder-last_outoforder)/screen_refresh, (lost-last_lost)/screen_refresh, )  
+        oorate, lostrate = ((outoforder-last_outoforder)/screen_refresh, (lost-last_lost)/screen_refresh, )
         last[ip] = (sent, received, lost, outoforder)
 
         if status[ip].name:
@@ -454,7 +454,8 @@ async def csv_task(status, filename, interval):
     with open(filename, "a") as csv_file:
       wr = csv.writer(csv_file, quoting=csv.QUOTE_MINIMAL)
       for ip in status:
-        wr.writerow(status[ip].csvRow(ip))
+        sent, received, lost, outoforder, rtt_avg, rtt_var = status[ip].get_human_metrics()
+        wr.writerow([ip, sent, received, lost, outoforder, rtt_avg, rtt_var])
 
     await asyncio.sleep(csv_refresh)
 
